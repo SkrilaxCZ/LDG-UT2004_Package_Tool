@@ -1,0 +1,30 @@
+# Pre-commit hooks for UT2004PackageUtil.
+#
+# Install hooks once with:
+#   uv run pre-commit install
+#
+# Run against all files with:
+#   uv run pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      # Sort imports (matches `ruff check --select I --fix`).
+      - id: ruff
+        name: ruff (import sorting)
+        args: ["--select", "I", "--fix"]
+      # Format code (matches `ruff format .`).
+      - id: ruff-format
