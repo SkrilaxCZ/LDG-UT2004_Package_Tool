@@ -1,0 +1,10 @@
+# Python
+.idea
+uv.lock
+.venv
+*.pyc
+__pycache__
+*.egg-info/
+
+#MacOS
+.DS_Store
