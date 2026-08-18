@@ -921,8 +921,16 @@ class UnObject(ABC):
             "type": self.__class__.__name__,
         }
         if self.tagged_properties:
+            # Scope ArrayProperty inner-type lookup to the export's own class so
+            # a property name shared by several classes (``Materials`` is both
+            # an object array on a LOD mesh and a struct array on a static mesh)
+            # resolves against the class that actually declares this value.
             d["tagged_properties"] = [
-                t.to_dict(self.export.package) for t in self.tagged_properties
+                t.to_dict(
+                    self.export.package,
+                    parent_struct_name=self.export.class_name_string,
+                )
+                for t in self.tagged_properties
             ]
         # Only save state_frame if it differs from default (all zeros)
         if self.state_frame is not None:
@@ -6015,6 +6023,2969 @@ class UnSound(_UnContentObject):
 
 
 # ===================================================================== #
+#  Mesh resources — shared value/array codecs
+# ===================================================================== #
+#
+# The mesh classes below share a small vocabulary of building blocks:
+#
+#   * fixed-shape float bundles (vector, plane, rotator) and the byte-tagged
+#     bounding box, held as plain dicts of named components;
+#   * :class:`_UnRawArray`, a counted native array whose elements carry no
+#     package references — the element bytes are kept verbatim, so the array
+#     re-serialises byte-for-byte and its bulk can be moved into a sidecar
+#     ``.bin`` file on XML export;
+#   * :class:`_UnLazyArray`, the same thing prefixed with the ABSOLUTE file
+#     offset of its end, which is recomputed from the object's write position;
+#   * :class:`_UnObjRef` / :class:`_UnNameRef`, single object/name references
+#     kept as resolved pointers so table renumbering and name pruning can
+#     re-derive their indices.
+#
+# Structs that contain references expose ``_object_refs()`` / ``_name_refs()``
+# generators so the owning object's ``resolve`` / ``link`` /
+# ``deduplicate_names`` passes can walk them without repeating the layout.
+
+_VECTOR_KEYS = ("x", "y", "z")
+_PLANE_KEYS = ("x", "y", "z", "w")
+_ROTATOR_KEYS = ("pitch", "yaw", "roll")
+_COLOR_KEYS = ("r", "g", "b", "a")
+
+# Key holding a raw array's element bytes in its dict form, and the key that
+# replaces it once ``_UnBulkSidecar`` has moved those bytes into a ``.bin``.
+_BULK_KEY = "bulk"
+_BULK_LENGTH_KEY = "bulk_length"
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Coerce a dict/XML value to an int, tolerating absent or empty text.
+
+    Args:
+        value (Any): The value to coerce.
+        default (int): The value to use when *value* is absent or empty.
+
+    Returns:
+        int: The coerced integer.
+    """
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Coerce a dict/XML value to a float, tolerating absent or empty text.
+
+    Args:
+        value (Any): The value to coerce.
+        default (float): The value to use when *value* is absent or empty.
+
+    Returns:
+        float: The coerced float.
+    """
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _as_list(value: Any) -> List[Any]:
+    """Coerce a dict/XML value to a list, tolerating an absent or empty entry.
+
+    An empty list has no child elements in the XML transport, so it comes back
+    as empty text rather than a list.
+
+    Args:
+        value (Any): The value to coerce.
+
+    Returns:
+        List[Any]: The value as a list, or an empty list.
+    """
+    return value if isinstance(value, list) else []
+
+
+def _read_count(reader: BinaryIO) -> int:
+    """Read an array element count, rejecting a negative value.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the count.
+
+    Returns:
+        int: The element count.
+
+    Raises:
+        ValueError: When the encoded count is negative.
+    """
+    count = read_index(reader)
+    if count < 0:
+        raise ValueError(f"negative array element count {count}")
+    return count
+
+
+def _read_exact(reader: BinaryIO, size: int) -> bytes:
+    """Read exactly *size* bytes, refusing a short read.
+
+    Args:
+        reader (BinaryIO): Stream to read from.
+        size (int): Number of bytes required.
+
+    Returns:
+        bytes: The bytes read.
+
+    Raises:
+        ValueError: When fewer than *size* bytes are available.
+    """
+    data = reader.read(size)
+    if len(data) != size:
+        raise ValueError(f"truncated payload: wanted {size} bytes, got {len(data)}")
+    return data
+
+
+def _read_float_bundle(reader: BinaryIO, keys) -> Dict[str, float]:
+    """Read one float32 per key, in key order.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the first component.
+        keys: The component names, in stream order.
+
+    Returns:
+        Dict[str, float]: The named components.
+    """
+    return {key: read_float(reader) for key in keys}
+
+
+def _write_float_bundle(writer: BinaryIO, values: Any, keys) -> None:
+    """Write one float32 per key, in key order.
+
+    Args:
+        writer (BinaryIO): Stream to write to.
+        values (Any): Mapping of component name to value (missing = 0.0).
+        keys: The component names, in stream order.
+    """
+    src = values if isinstance(values, dict) else {}
+    for key in keys:
+        write_float(writer, _as_float(src.get(key)))
+
+
+def _float_bundle_to_dict(values: Dict[str, float]) -> Dict[str, str]:
+    """Render a float bundle as shortest-round-tripping decimal literals.
+
+    Args:
+        values (Dict[str, float]): The named components.
+
+    Returns:
+        Dict[str, str]: The components as float32 literals.
+    """
+    return {key: format_float32(value) for key, value in values.items()}
+
+
+def _float_bundle_from_dict(data: Any, keys) -> Dict[str, float]:
+    """Rebuild a float bundle from its dict representation.
+
+    Args:
+        data (Any): The dict representation (or anything else, treated as empty).
+        keys: The component names, in stream order.
+
+    Returns:
+        Dict[str, float]: The named components.
+    """
+    src = data if isinstance(data, dict) else {}
+    return {key: _as_float(src.get(key)) for key in keys}
+
+
+def _read_int_bundle(reader: BinaryIO, keys) -> Dict[str, int]:
+    """Read one int32 per key, in key order.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the first component.
+        keys: The component names, in stream order.
+
+    Returns:
+        Dict[str, int]: The named components.
+    """
+    return {key: read_int(reader) for key in keys}
+
+
+def _write_int_bundle(writer: BinaryIO, values: Any, keys) -> None:
+    """Write one int32 per key, in key order.
+
+    Args:
+        writer (BinaryIO): Stream to write to.
+        values (Any): Mapping of component name to value (missing = 0).
+        keys: The component names, in stream order.
+    """
+    src = values if isinstance(values, dict) else {}
+    for key in keys:
+        write_int(writer, _as_int(src.get(key)))
+
+
+def _int_bundle_from_dict(data: Any, keys) -> Dict[str, int]:
+    """Rebuild an int bundle from its dict representation.
+
+    Args:
+        data (Any): The dict representation (or anything else, treated as empty).
+        keys: The component names, in stream order.
+
+    Returns:
+        Dict[str, int]: The named components.
+    """
+    src = data if isinstance(data, dict) else {}
+    return {key: _as_int(src.get(key)) for key in keys}
+
+
+def _read_byte_bundle(reader: BinaryIO, keys) -> Dict[str, int]:
+    """Read one byte per key, in key order.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the first component.
+        keys: The component names, in stream order.
+
+    Returns:
+        Dict[str, int]: The named components.
+    """
+    return {key: read_byte(reader) for key in keys}
+
+
+def _write_byte_bundle(writer: BinaryIO, values: Any, keys) -> None:
+    """Write one byte per key, in key order.
+
+    Args:
+        writer (BinaryIO): Stream to write to.
+        values (Any): Mapping of component name to value (missing = 0).
+        keys: The component names, in stream order.
+    """
+    src = values if isinstance(values, dict) else {}
+    for key in keys:
+        write_byte(writer, _as_int(src.get(key)))
+
+
+def _empty_box() -> Dict[str, Any]:
+    """Return a zeroed, invalid bounding box.
+
+    Returns:
+        Dict[str, Any]: A bounding box with zero extents and ``is_valid`` 0.
+    """
+    return {
+        "min": dict.fromkeys(_VECTOR_KEYS, 0.0),
+        "max": dict.fromkeys(_VECTOR_KEYS, 0.0),
+        "is_valid": 0,
+    }
+
+
+def _read_box(reader: BinaryIO) -> Dict[str, Any]:
+    """Read a bounding box: two vectors plus a validity byte.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the box.
+
+    Returns:
+        Dict[str, Any]: The parsed bounding box.
+    """
+    return {
+        "min": _read_float_bundle(reader, _VECTOR_KEYS),
+        "max": _read_float_bundle(reader, _VECTOR_KEYS),
+        "is_valid": read_byte(reader),
+    }
+
+
+def _write_box(writer: BinaryIO, box: Any) -> None:
+    """Write a bounding box: two vectors plus a validity byte.
+
+    Args:
+        writer (BinaryIO): Stream to write to.
+        box (Any): The bounding box dict.
+    """
+    src = box if isinstance(box, dict) else {}
+    _write_float_bundle(writer, src.get("min"), _VECTOR_KEYS)
+    _write_float_bundle(writer, src.get("max"), _VECTOR_KEYS)
+    write_byte(writer, _as_int(src.get("is_valid")))
+
+
+def _box_to_dict(box: Dict[str, Any]) -> Dict[str, Any]:
+    """Render a bounding box for the dict/XML transport.
+
+    Args:
+        box (Dict[str, Any]): The bounding box to render.
+
+    Returns:
+        Dict[str, Any]: The transport representation.
+    """
+    return {
+        "min": _float_bundle_to_dict(box["min"]),
+        "max": _float_bundle_to_dict(box["max"]),
+        "is_valid": box["is_valid"],
+    }
+
+
+def _box_from_dict(data: Any) -> Dict[str, Any]:
+    """Rebuild a bounding box from its dict representation.
+
+    Args:
+        data (Any): The dict representation.
+
+    Returns:
+        Dict[str, Any]: The parsed bounding box.
+    """
+    src = data if isinstance(data, dict) else {}
+    return {
+        "min": _float_bundle_from_dict(src.get("min"), _VECTOR_KEYS),
+        "max": _float_bundle_from_dict(src.get("max"), _VECTOR_KEYS),
+        "is_valid": _as_int(src.get("is_valid")),
+    }
+
+
+class _UnObjRef:
+    """A package object reference: a compact index plus its resolved item.
+
+    The item pointer is what survives table renumbering; the index is
+    re-derived from it on save (mirroring :class:`UnField`'s super/next refs).
+    """
+
+    __slots__ = ("index", "item")
+
+    def __init__(self) -> None:
+        """Initialise an empty (``None``) reference."""
+        self.index: int = 0
+        self.item: Optional["UnPackageItem"] = None
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Read the reference index from the stream.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the compact index.
+        """
+        self.index = read_index(reader)
+
+    def serialize(self, writer: BinaryIO) -> None:
+        """Write the reference index to the stream.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+        """
+        write_index(writer, self.index)
+
+    def resolve(self, package: "UnPackage") -> None:
+        """Resolve the index into an item pointer.
+
+        Args:
+            package ("UnPackage"): The owning package.
+        """
+        self.item = resolve_item(package, self.index)
+
+    def link(self, package: "UnPackage") -> None:
+        """Re-derive the index from the item pointer.
+
+        Args:
+            package ("UnPackage"): The owning package.
+        """
+        self.index = link_item(package, self.item)
+
+    def to_str(self, owner: "UnObject") -> str:
+        """Return the reference as a prefixed name string.
+
+        Args:
+            owner ("UnObject"): The object that owns this reference.
+
+        Returns:
+            str: The prefixed name string.
+        """
+        return owner._resolve_object_ref(self.index)
+
+    def from_str(self, owner: "UnObject", value: Any) -> None:
+        """Populate the reference from a prefixed name string.
+
+        Args:
+            owner ("UnObject"): The object that owns this reference.
+            value (Any): The prefixed name string.
+        """
+        self.index = owner._link_object_ref(str(value or ""))
+
+
+class _UnNameRef:
+    """A name-table reference held as a pointer to its table entry.
+
+    Storing the entry (rather than an index) keeps the reference valid across
+    name-table rebuilds; the index is re-derived on save.
+    """
+
+    __slots__ = ("entry",)
+
+    def __init__(self) -> None:
+        """Initialise an unset reference."""
+        self.entry: Optional["UnName"] = None
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Read the name index and capture the table entry.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the compact index.
+            package ("UnPackage"): The owning package.
+        """
+        index = read_index(reader)
+        self.entry = package.names[index] if 0 <= index < len(package.names) else None
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Write the name index of the referenced entry.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        write_index(writer, package.name_index(self.entry) if self.entry else 0)
+
+    def deduplicate(self, package: "UnPackage") -> None:
+        """Re-resolve the entry after the name table was rebuilt.
+
+        Args:
+            package ("UnPackage"): The owning package.
+        """
+        if self.entry is not None:
+            self.entry = package.find_name(self.entry.name)
+
+    def to_str(self, owner: "UnObject") -> str:
+        """Return the reference as a ``Name`` / ``Name@N`` string.
+
+        Args:
+            owner ("UnObject"): The object that owns this reference.
+
+        Returns:
+            str: The resolved name string.
+        """
+        if self.entry is None:
+            return ""
+        package = owner.export.package
+        return package.resolve_name_index(package.name_index(self.entry))
+
+    def from_str(self, owner: "UnObject", value: Any) -> None:
+        """Populate the reference from a ``Name`` / ``Name@N`` string.
+
+        Args:
+            owner ("UnObject"): The object that owns this reference.
+            value (Any): The name string.
+        """
+        text = str(value or "")
+        if not text:
+            self.entry = None
+            return
+        package = owner.export.package
+        index = owner._link_name_index(text)
+        self.entry = package.names[index] if 0 <= index < len(package.names) else None
+
+
+class _UnRawArray:
+    """A counted native array whose elements hold no package references.
+
+    Only the element count is structural; the element bytes are kept verbatim
+    so the array re-serialises byte-for-byte and its bulk can be offloaded to a
+    sidecar ``.bin`` file on XML export.  With a fixed *elem_size* the count is
+    implied by the payload length; subclasses with a variable element size
+    (see :class:`_UnStaticMeshTriangleArray`) pass ``0`` and keep the count.
+    """
+
+    def __init__(self, elem_size: int) -> None:
+        """Initialise an empty array.
+
+        Args:
+            elem_size (int): Bytes per element, or 0 when it varies.
+        """
+        self.elem_size = elem_size
+        self.count: int = 0
+        self.data: bytes = b""
+
+    def _read_elements(self, reader: BinaryIO, count: int) -> bytes:
+        """Read the element bytes for *count* elements.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the first element.
+            count (int): Number of elements to read.
+
+        Returns:
+            bytes: The element bytes.
+        """
+        return _read_exact(reader, count * self.elem_size)
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Read the element count and the element bytes.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the count.
+        """
+        self.count = _read_count(reader)
+        self.data = self._read_elements(reader, self.count)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Write the element count followed by the element bytes.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object in
+                the output stream (unused here; see :class:`_UnLazyArray`).
+        """
+        write_index(writer, self.count)
+        writer.write(self.data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the array's dict representation.
+
+        ``count`` is informational — it is re-derived from the payload on
+        import whenever the element size is fixed.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {"count": self.count, _BULK_KEY: bytes_to_hex(self.data)}
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the array from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.data = hex_to_bytes(str(src.get(_BULK_KEY, "")))
+        if self.elem_size:
+            self.count = len(self.data) // self.elem_size
+        else:
+            self.count = _as_int(src.get("count"))
+
+
+class _UnLazyArray(_UnRawArray):
+    """A native array prefixed with the absolute file offset of its end.
+
+    The offset points at the first byte past the element data.  It is
+    recomputed from the owning object's write position so it stays correct
+    wherever the object lands in the output file.
+
+    ``end_offset`` and ``end_position`` keep what the parse actually read — the
+    stored absolute offset, and the payload-relative position the elements
+    ended at.  A well-formed array satisfies
+    ``end_offset == <object's file offset> + end_position``.
+    """
+
+    def __init__(self, elem_size: int) -> None:
+        """Initialise an empty array with no recorded end offset.
+
+        Args:
+            elem_size (int): Bytes per element, or 0 when it varies.
+        """
+        super().__init__(elem_size)
+        self.end_offset: int = 0
+        self.end_position: int = 0
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Read the stored end offset, then the array.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the end offset.
+        """
+        self.end_offset = read_int(reader)
+        super().parse(reader)
+        self.end_position = reader.tell()
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Write the array, back-patching its absolute end offset.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object in
+                the output stream.
+        """
+        offset_pos = writer.tell()
+        write_int(writer, 0)  # placeholder end offset
+        super().serialize(writer, stream_position)
+        self.end_position = writer.tell()
+        self.end_offset = stream_position + self.end_position
+        resume = writer.tell()
+        writer.seek(offset_pos)
+        write_int(writer, self.end_offset)
+        writer.seek(resume)
+
+
+class _UnStaticMeshTriangleArray(_UnLazyArray):
+    """A static mesh's source triangle list.
+
+    Each triangle's size depends on how many UV sets it carries::
+
+        <3 x vector> <UV set count : int32>
+        per UV set: <3 x UV pair : 2 x float32>
+        <3 x colour : 4 bytes> <material index : int32> <smoothing mask : uint32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty, variable-stride triangle list."""
+        super().__init__(0)
+
+    def _read_elements(self, reader: BinaryIO, count: int) -> bytes:
+        """Read *count* triangles, sizing each from its UV set count.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the first triangle.
+            count (int): Number of triangles to read.
+
+        Returns:
+            bytes: The verbatim triangle bytes.
+        """
+        out = bytearray()
+        for _ in range(count):
+            head = _read_exact(reader, 3 * 12 + 4)  # vertices + UV set count
+            num_uvs = unpack_int(head[-4:])
+            if num_uvs < 0:
+                raise ValueError(f"negative UV set count {num_uvs}")
+            out += head
+            # per-UV-set coordinates, then colours, material index, mask
+            out += _read_exact(reader, num_uvs * 3 * 8 + 3 * 4 + 4 + 4)
+        return bytes(out)
+
+
+class _UnStream:
+    """A counted native element array followed by its revision counter.
+
+    Covers the vertex, colour and index streams, which differ only in their
+    element size::
+
+        <element count : compact index> <elements> <revision : int32>
+    """
+
+    def __init__(self, elem_size: int) -> None:
+        """Initialise an empty stream.
+
+        Args:
+            elem_size (int): Bytes per element.
+        """
+        self.elements = _UnRawArray(elem_size)
+        self.revision: int = 0
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Read the elements and the revision counter.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the element count.
+        """
+        self.elements.parse(reader)
+        self.revision = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Write the elements and the revision counter.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        self.elements.serialize(writer, stream_position)
+        write_int(writer, self.revision)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the stream's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {"elements": self.elements.to_dict(), "revision": self.revision}
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the stream from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.elements.from_dict(src.get("elements"))
+        self.revision = _as_int(src.get("revision"))
+
+
+def _walk_bulk_out(node: Any, blob: bytearray) -> None:
+    """Move every raw-array payload under *node* into *blob*, in place.
+
+    Each payload's hex text is replaced by its byte length, so the (large)
+    element bytes can live in a single sidecar file while the XML keeps only
+    the structure.  Traversal follows dict insertion / list order, which the
+    XML transport preserves, so :func:`_walk_bulk_in` can restore them.
+
+    Args:
+        node (Any): The dict/list tree to rewrite in place.
+        blob (bytearray): The accumulating sidecar payload.
+    """
+    if isinstance(node, dict):
+        if _BULK_KEY in node:
+            raw = hex_to_bytes(str(node.pop(_BULK_KEY)))
+            node[_BULK_LENGTH_KEY] = len(raw)
+            blob += raw
+            return
+        for value in node.values():
+            _walk_bulk_out(value, blob)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_bulk_out(value, blob)
+
+
+def _walk_bulk_in(node: Any, blob: bytes, cursor: List[int]) -> None:
+    """Restore raw-array payloads under *node* from *blob*, in place.
+
+    Inverse of :func:`_walk_bulk_out`.
+
+    Args:
+        node (Any): The dict/list tree to rewrite in place.
+        blob (bytes): The sidecar payload.
+        cursor (List[int]): Single-element read position, advanced in place.
+    """
+    if isinstance(node, dict):
+        if _BULK_LENGTH_KEY in node:
+            length = _as_int(node.pop(_BULK_LENGTH_KEY))
+            start = cursor[0]
+            node[_BULK_KEY] = bytes_to_hex(blob[start : start + length])
+            cursor[0] = start + length
+            return
+        for value in node.values():
+            _walk_bulk_in(value, blob, cursor)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_bulk_in(value, blob, cursor)
+
+
+class _UnBulkSidecar:
+    """Moves an object's raw-array element bytes into a sidecar ``.bin`` file.
+
+    Mesh payloads are mostly bulk vertex/index/key data.  Keeping it as hex in
+    the XML would dwarf the structure it belongs to, so on export every raw
+    array's payload is appended to one ``<Class>/<Object>.bin`` file (in
+    traversal order) and the XML keeps just its length.
+    """
+
+    export: "UnExport"
+
+    def export_xml(self, obj_dict: Dict[str, Any], output_dir: str) -> None:
+        """Move bulk element bytes into a sidecar ``.bin`` file.
+
+        Args:
+            obj_dict (Dict[str, Any]): The object dictionary to update in place.
+            output_dir (str): The directory to write the sidecar file into.
+        """
+        blob = bytearray()
+        _walk_bulk_out(obj_dict, blob)
+        subdir_name = self.__class__.__name__
+        bin_filename = self.export.object_name_string + ".bin"
+        bin_subdir = os.path.join(output_dir, subdir_name)
+        os.makedirs(bin_subdir, exist_ok=True)
+        with open(os.path.join(bin_subdir, bin_filename), "wb") as f:
+            f.write(bytes(blob))
+        obj_dict["bulk_data_file"] = bin_filename
+
+    def import_xml(self, obj_dict: Dict[str, Any], input_dir: str) -> None:
+        """Read bulk element bytes back from the sidecar ``.bin`` file.
+
+        Args:
+            obj_dict (Dict[str, Any]): The object dictionary to update in place.
+            input_dir (str): The directory to read the sidecar file from.
+        """
+        bin_filename = obj_dict.pop("bulk_data_file", "")
+        if not bin_filename:
+            return
+        subdir_name = self.__class__.__name__
+        with open(os.path.join(input_dir, subdir_name, bin_filename), "rb") as f:
+            blob = f.read()
+        _walk_bulk_in(obj_dict, blob, [0])
+
+
+class _UnMeshResource(_UnBulkSidecar, _UnContentObject):
+    """Base for the mesh resources.
+
+    Adds two things to the standard content object: the sidecar handling for
+    bulk element data, and reference walking.  Subclasses declare where their
+    object and name references live by overriding ``_object_refs()`` /
+    ``_name_refs()``; the resolve, link and name-deduplication passes follow
+    those from here instead of each type repeating them.
+    """
+
+    def _object_refs(self):
+        """Yield every object reference in this resource.
+
+        Yields:
+            _UnObjRef: Each object reference, in layout order.
+        """
+        return iter(())
+
+    def _name_refs(self):
+        """Yield every name reference in this resource.
+
+        Yields:
+            _UnNameRef: Each name reference, in layout order.
+        """
+        return iter(())
+
+    def resolve(self) -> None:
+        """Resolve every object reference into an item pointer."""
+        super().resolve()
+        package = self.export.package
+        for ref in self._object_refs():
+            ref.resolve(package)
+
+    def link(self) -> None:
+        """Re-derive every object reference index from its item pointer."""
+        super().link()
+        package = self.export.package
+        for ref in self._object_refs():
+            ref.link(package)
+
+    def clear_resolved(self) -> None:
+        """Drop every resolved item pointer."""
+        super().clear_resolved()
+        for ref in self._object_refs():
+            ref.item = None
+
+    def clear_links(self) -> None:
+        """Zero every object reference index, keeping item pointers."""
+        super().clear_links()
+        for ref in self._object_refs():
+            ref.index = 0
+
+    def deduplicate_names(self) -> None:
+        """Re-resolve every name reference after a name-table rebuild."""
+        super().deduplicate_names()
+        package = self.export.package
+        for ref in self._name_refs():
+            ref.deduplicate(package)
+
+
+# ===================================================================== #
+#  Mesh resources — object types
+# ===================================================================== #
+
+
+class UnPrimitive(_UnMeshResource):
+    """A renderable, collidable geometric resource.
+
+    After the standard object payload come the resource's bounds::
+
+        <bounding box : 2 x vector + validity byte>
+        <bounding sphere : centre vector + radius float32>
+    """
+
+    def __init__(self, export: "UnExport") -> None:
+        """Initialise the primitive with empty bounds.
+
+        Args:
+            export ("UnExport"): The export entry that owns this primitive.
+        """
+        super().__init__(export)
+        self.bounding_box: Dict[str, Any] = _empty_box()
+        self.bounding_sphere: Dict[str, float] = dict.fromkeys(_PLANE_KEYS, 0.0)
+
+    def _parse_tail(self, reader: BinaryIO) -> None:
+        """Parse the resource bounds.
+
+        Args:
+            reader (BinaryIO): Stream positioned just past the ``None`` name.
+        """
+        super()._parse_tail(reader)
+        self.bounding_box = _read_box(reader)
+        self.bounding_sphere = _read_float_bundle(reader, _PLANE_KEYS)
+
+    def _serialize_tail(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the resource bounds.
+
+        Args:
+            writer (BinaryIO): Stream positioned just past the ``None`` name.
+            stream_position (int): Absolute position of the object in the
+                output stream.
+        """
+        super()._serialize_tail(writer, stream_position)
+        _write_box(writer, self.bounding_box)
+        _write_float_bundle(writer, self.bounding_sphere, _PLANE_KEYS)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the primitive's dict representation.
+
+        Returns:
+            Dict[str, Any]: The serialisable dict representation.
+        """
+        d = super().to_dict()
+        d["bounding_box"] = _box_to_dict(self.bounding_box)
+        d["bounding_sphere"] = _float_bundle_to_dict(self.bounding_sphere)
+        return d
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the primitive from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The dict representation to load from.
+        """
+        super().from_dict(data)
+        self.bounding_box = _box_from_dict(data.get("bounding_box"))
+        self.bounding_sphere = _float_bundle_from_dict(
+            data.get("bounding_sphere"), _PLANE_KEYS
+        )
+
+
+class UnMesh(UnPrimitive):
+    """Base for the animated mesh resources.
+
+    Contributes no data of its own to a stored package: its only member is the
+    shared default instance, which lives purely at runtime.
+    """
+
+
+class _UnImpostorProps:
+    """A mesh's impostor-sprite settings.
+
+    Layout::
+
+        <material : object ref> <relative location : vector>
+        <relative rotation : rotator> <scale 3D : vector> <colour : 4 bytes>
+        <space mode : int32> <draw mode : int32> <light mode : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise zeroed impostor settings."""
+        self.material = _UnObjRef()
+        self.relative_location: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.relative_rotation: Dict[str, int] = dict.fromkeys(_ROTATOR_KEYS, 0)
+        self.scale_3d: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.color: Dict[str, int] = dict.fromkeys(_COLOR_KEYS, 0)
+        self.space_mode: int = 0
+        self.draw_mode: int = 0
+        self.light_mode: int = 0
+
+    def _object_refs(self):
+        """Yield the impostor material reference.
+
+        Yields:
+            _UnObjRef: The material reference.
+        """
+        yield self.material
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the impostor settings.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the material reference.
+        """
+        self.material.parse(reader)
+        self.relative_location = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.relative_rotation = _read_int_bundle(reader, _ROTATOR_KEYS)
+        self.scale_3d = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.color = _read_byte_bundle(reader, _COLOR_KEYS)
+        self.space_mode = read_int(reader)
+        self.draw_mode = read_int(reader)
+        self.light_mode = read_int(reader)
+
+    def serialize(self, writer: BinaryIO) -> None:
+        """Serialise the impostor settings.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+        """
+        self.material.serialize(writer)
+        _write_float_bundle(writer, self.relative_location, _VECTOR_KEYS)
+        _write_int_bundle(writer, self.relative_rotation, _ROTATOR_KEYS)
+        _write_float_bundle(writer, self.scale_3d, _VECTOR_KEYS)
+        _write_byte_bundle(writer, self.color, _COLOR_KEYS)
+        write_int(writer, self.space_mode)
+        write_int(writer, self.draw_mode)
+        write_int(writer, self.light_mode)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the impostor settings' dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns these settings.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "material": self.material.to_str(owner),
+            "relative_location": _float_bundle_to_dict(self.relative_location),
+            "relative_rotation": dict(self.relative_rotation),
+            "scale_3d": _float_bundle_to_dict(self.scale_3d),
+            "color": dict(self.color),
+            "space_mode": self.space_mode,
+            "draw_mode": self.draw_mode,
+            "light_mode": self.light_mode,
+        }
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the impostor settings from their dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns these settings.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.material.from_str(owner, src.get("material"))
+        self.relative_location = _float_bundle_from_dict(
+            src.get("relative_location"), _VECTOR_KEYS
+        )
+        self.relative_rotation = _int_bundle_from_dict(
+            src.get("relative_rotation"), _ROTATOR_KEYS
+        )
+        self.scale_3d = _float_bundle_from_dict(src.get("scale_3d"), _VECTOR_KEYS)
+        self.color = _int_bundle_from_dict(src.get("color"), _COLOR_KEYS)
+        self.space_mode = _as_int(src.get("space_mode"))
+        self.draw_mode = _as_int(src.get("draw_mode"))
+        self.light_mode = _as_int(src.get("light_mode"))
+
+
+class UnLodMesh(UnMesh):
+    """Base for the level-of-detail mesh resources.
+
+    After the primitive bounds comes the shared LOD geometry::
+
+        <internal version : int32> <model vertex count : int32>
+        <packed vertices : 4 bytes each> <materials : object ref array>
+        <scale : vector> <origin : vector> <rotation origin : rotator>
+        <face LOD levels : 2 bytes each> <faces : 8 bytes each>
+        <wedge collapse list : 2 bytes each> <wedges : 10 bytes each>
+        <mesh materials : 8 bytes each> <max mesh scale : float32>
+        <LOD hysteresis / strength : float32> <LOD min vertices : int32>
+        <LOD morph / Z displacement : float32>
+        internal version >= 3: <impostor present : int32> <impostor settings>
+        internal version >= 4: <skin tesselation factor : float32>
+
+    Internal versions below 2 store two extra legacy arrays that this type does
+    not model; such a resource falls back to a verbatim payload.
+    """
+
+    def __init__(self, export: "UnExport") -> None:
+        """Initialise an empty LOD mesh.
+
+        Args:
+            export ("UnExport"): The export entry that owns this mesh.
+        """
+        super().__init__(export)
+        self.internal_version: int = 0
+        self.model_verts: int = 0
+        self.verts = _UnRawArray(4)
+        self.materials: List[_UnObjRef] = []
+        self.scale: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.origin: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.rot_origin: Dict[str, int] = dict.fromkeys(_ROTATOR_KEYS, 0)
+        self.face_level = _UnRawArray(2)
+        self.faces = _UnRawArray(8)
+        self.collapse_wedge_thus = _UnRawArray(2)
+        self.wedges = _UnRawArray(10)
+        self.mesh_materials = _UnRawArray(8)
+        self.mesh_scale_max: float = 0.0
+        self.lod_hysteresis: float = 0.0
+        self.lod_strength: float = 0.0
+        self.lod_min_verts: int = 0
+        self.lod_morph: float = 0.0
+        self.lod_z_displace: float = 0.0
+        self.impostor_present: int = 0
+        self.impostor_props = _UnImpostorProps()
+        self.skin_tesselation_factor: float = 0.0
+
+    def _object_refs(self):
+        """Yield every object reference in this mesh.
+
+        Yields:
+            _UnObjRef: Each object reference, in layout order.
+        """
+        yield from super()._object_refs()
+        yield from self.materials
+        yield from self.impostor_props._object_refs()
+
+    def _parse_tail(self, reader: BinaryIO) -> None:
+        """Parse the shared LOD geometry.
+
+        Args:
+            reader (BinaryIO): Stream positioned just past the ``None`` name.
+
+        Raises:
+            ValueError: When the internal version predates LOD levels.
+        """
+        super()._parse_tail(reader)
+        self.internal_version = read_int(reader)
+        if self.internal_version < 2:
+            raise ValueError(
+                f"unsupported mesh internal version {self.internal_version}"
+            )
+        self.model_verts = read_int(reader)
+        self.verts.parse(reader)
+        self.materials = [_UnObjRef() for _ in range(_read_count(reader))]
+        for ref in self.materials:
+            ref.parse(reader)
+        self.scale = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.origin = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.rot_origin = _read_int_bundle(reader, _ROTATOR_KEYS)
+        self.face_level.parse(reader)
+        self.faces.parse(reader)
+        self.collapse_wedge_thus.parse(reader)
+        self.wedges.parse(reader)
+        self.mesh_materials.parse(reader)
+        self.mesh_scale_max = read_float(reader)
+        self.lod_hysteresis = read_float(reader)
+        self.lod_strength = read_float(reader)
+        self.lod_min_verts = read_int(reader)
+        self.lod_morph = read_float(reader)
+        self.lod_z_displace = read_float(reader)
+        if self.internal_version >= 3:
+            self.impostor_present = read_int(reader)
+            self.impostor_props.parse(reader)
+        if self.internal_version >= 4:
+            self.skin_tesselation_factor = read_float(reader)
+
+    def _serialize_tail(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the shared LOD geometry.
+
+        Args:
+            writer (BinaryIO): Stream positioned just past the ``None`` name.
+            stream_position (int): Absolute position of the object in the
+                output stream.
+        """
+        super()._serialize_tail(writer, stream_position)
+        write_int(writer, self.internal_version)
+        write_int(writer, self.model_verts)
+        self.verts.serialize(writer, stream_position)
+        write_index(writer, len(self.materials))
+        for ref in self.materials:
+            ref.serialize(writer)
+        _write_float_bundle(writer, self.scale, _VECTOR_KEYS)
+        _write_float_bundle(writer, self.origin, _VECTOR_KEYS)
+        _write_int_bundle(writer, self.rot_origin, _ROTATOR_KEYS)
+        self.face_level.serialize(writer, stream_position)
+        self.faces.serialize(writer, stream_position)
+        self.collapse_wedge_thus.serialize(writer, stream_position)
+        self.wedges.serialize(writer, stream_position)
+        self.mesh_materials.serialize(writer, stream_position)
+        write_float(writer, self.mesh_scale_max)
+        write_float(writer, self.lod_hysteresis)
+        write_float(writer, self.lod_strength)
+        write_int(writer, self.lod_min_verts)
+        write_float(writer, self.lod_morph)
+        write_float(writer, self.lod_z_displace)
+        if self.internal_version >= 3:
+            write_int(writer, self.impostor_present)
+            self.impostor_props.serialize(writer)
+        if self.internal_version >= 4:
+            write_float(writer, self.skin_tesselation_factor)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the LOD mesh's dict representation.
+
+        Returns:
+            Dict[str, Any]: The serialisable dict representation.
+        """
+        d = super().to_dict()
+        d["internal_version"] = self.internal_version
+        d["model_verts"] = self.model_verts
+        d["verts"] = self.verts.to_dict()
+        d["materials"] = [ref.to_str(self) for ref in self.materials]
+        d["scale"] = _float_bundle_to_dict(self.scale)
+        d["origin"] = _float_bundle_to_dict(self.origin)
+        d["rot_origin"] = dict(self.rot_origin)
+        d["face_level"] = self.face_level.to_dict()
+        d["faces"] = self.faces.to_dict()
+        d["collapse_wedge_thus"] = self.collapse_wedge_thus.to_dict()
+        d["wedges"] = self.wedges.to_dict()
+        d["mesh_materials"] = self.mesh_materials.to_dict()
+        d["mesh_scale_max"] = format_float32(self.mesh_scale_max)
+        d["lod_hysteresis"] = format_float32(self.lod_hysteresis)
+        d["lod_strength"] = format_float32(self.lod_strength)
+        d["lod_min_verts"] = self.lod_min_verts
+        d["lod_morph"] = format_float32(self.lod_morph)
+        d["lod_z_displace"] = format_float32(self.lod_z_displace)
+        if self.internal_version >= 3:
+            d["impostor_present"] = self.impostor_present
+            d["impostor_props"] = self.impostor_props.to_dict(self)
+        if self.internal_version >= 4:
+            d["skin_tesselation_factor"] = format_float32(self.skin_tesselation_factor)
+        return d
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the LOD mesh from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The dict representation to load from.
+        """
+        super().from_dict(data)
+        self.internal_version = _as_int(data.get("internal_version"))
+        self.model_verts = _as_int(data.get("model_verts"))
+        self.verts.from_dict(data.get("verts"))
+        self.materials = []
+        for value in _as_list(data.get("materials")):
+            ref = _UnObjRef()
+            ref.from_str(self, value)
+            self.materials.append(ref)
+        self.scale = _float_bundle_from_dict(data.get("scale"), _VECTOR_KEYS)
+        self.origin = _float_bundle_from_dict(data.get("origin"), _VECTOR_KEYS)
+        self.rot_origin = _int_bundle_from_dict(data.get("rot_origin"), _ROTATOR_KEYS)
+        self.face_level.from_dict(data.get("face_level"))
+        self.faces.from_dict(data.get("faces"))
+        self.collapse_wedge_thus.from_dict(data.get("collapse_wedge_thus"))
+        self.wedges.from_dict(data.get("wedges"))
+        self.mesh_materials.from_dict(data.get("mesh_materials"))
+        self.mesh_scale_max = _as_float(data.get("mesh_scale_max"))
+        self.lod_hysteresis = _as_float(data.get("lod_hysteresis"))
+        self.lod_strength = _as_float(data.get("lod_strength"))
+        self.lod_min_verts = _as_int(data.get("lod_min_verts"))
+        self.lod_morph = _as_float(data.get("lod_morph"))
+        self.lod_z_displace = _as_float(data.get("lod_z_displace"))
+        self.impostor_present = _as_int(data.get("impostor_present"))
+        self.impostor_props.from_dict(data.get("impostor_props"), self)
+        self.skin_tesselation_factor = _as_float(data.get("skin_tesselation_factor"))
+
+
+class _UnMeshBone:
+    """One bone of a skeletal mesh's reference skeleton.
+
+    Layout::
+
+        <name : name ref> <flags : uint32>
+        <orientation : quaternion> <position : vector> <sizes : 4 x float32>
+        <child count : int32> <parent index : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise a zeroed, unnamed bone."""
+        self.name = _UnNameRef()
+        self.flags: int = 0
+        self.orientation: Dict[str, float] = dict.fromkeys(_PLANE_KEYS, 0.0)
+        self.position: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.sizes: List[float] = [0.0] * 4
+        self.num_children: int = 0
+        self.parent_index: int = 0
+
+    def _name_refs(self):
+        """Yield the bone's name reference.
+
+        Yields:
+            _UnNameRef: The bone name.
+        """
+        yield self.name
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Parse the bone.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the bone name.
+            package ("UnPackage"): The owning package.
+        """
+        self.name.parse(reader, package)
+        self.flags = read_uint(reader)
+        self.orientation = _read_float_bundle(reader, _PLANE_KEYS)
+        self.position = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.sizes = [read_float(reader) for _ in range(4)]
+        self.num_children = read_int(reader)
+        self.parent_index = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Serialise the bone.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        self.name.serialize(writer, package)
+        write_uint(writer, self.flags)
+        _write_float_bundle(writer, self.orientation, _PLANE_KEYS)
+        _write_float_bundle(writer, self.position, _VECTOR_KEYS)
+        for index in range(4):
+            write_float(writer, self.sizes[index] if index < len(self.sizes) else 0.0)
+        write_int(writer, self.num_children)
+        write_int(writer, self.parent_index)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the bone's dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns this bone.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "name": self.name.to_str(owner),
+            "flags": self.flags,
+            "orientation": _float_bundle_to_dict(self.orientation),
+            "position": _float_bundle_to_dict(self.position),
+            "sizes": [format_float32(value) for value in self.sizes],
+            "num_children": self.num_children,
+            "parent_index": self.parent_index,
+        }
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the bone from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns this bone.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.name.from_str(owner, src.get("name"))
+        self.flags = _as_int(src.get("flags"))
+        self.orientation = _float_bundle_from_dict(src.get("orientation"), _PLANE_KEYS)
+        self.position = _float_bundle_from_dict(src.get("position"), _VECTOR_KEYS)
+        sizes = _as_list(src.get("sizes"))
+        self.sizes = [_as_float(sizes[i]) if i < len(sizes) else 0.0 for i in range(4)]
+        self.num_children = _as_int(src.get("num_children"))
+        self.parent_index = _as_int(src.get("parent_index"))
+
+
+class _UnWeightIndex:
+    """One entry of a skeletal mesh's legacy weight index.
+
+    Layout::
+
+        <point indices : 2 bytes each> <weight base : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty weight index entry."""
+        self.point_indices = _UnRawArray(2)
+        self.weight_base: int = 0
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the entry.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the point index count.
+        """
+        self.point_indices.parse(reader)
+        self.weight_base = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the entry.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        self.point_indices.serialize(writer, stream_position)
+        write_int(writer, self.weight_base)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the entry's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "point_indices": self.point_indices.to_dict(),
+            "weight_base": self.weight_base,
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the entry from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.point_indices.from_dict(src.get("point_indices"))
+        self.weight_base = _as_int(src.get("weight_base"))
+
+
+class _UnSkinVertexStream:
+    """A skeletal mesh's rigid-part vertex stream.
+
+    Layout::
+
+        <revision : int32> <partial : int32> <stream callback : int32>
+        <vertices : 32 bytes each>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty skin vertex stream."""
+        self.revision: int = 0
+        self.partial: int = 0
+        self.stream_callback: int = 0
+        self.vertices = _UnRawArray(32)
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the stream.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the revision counter.
+        """
+        self.revision = read_int(reader)
+        self.partial = read_int(reader)
+        self.stream_callback = read_int(reader)
+        self.vertices.parse(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the stream.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        write_int(writer, self.revision)
+        write_int(writer, self.partial)
+        write_int(writer, self.stream_callback)
+        self.vertices.serialize(writer, stream_position)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the stream's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "revision": self.revision,
+            "partial": self.partial,
+            "stream_callback": self.stream_callback,
+            "vertices": self.vertices.to_dict(),
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the stream from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.revision = _as_int(src.get("revision"))
+        self.partial = _as_int(src.get("partial"))
+        self.stream_callback = _as_int(src.get("stream_callback"))
+        self.vertices.from_dict(src.get("vertices"))
+
+
+class _UnStaticLodModel:
+    """One discrete LOD level of a skeletal mesh.
+
+    Layout::
+
+        <skinning stream : 4 bytes each> <smooth vertices : 16 bytes each>
+        <smooth stream wedge count : int32>
+        <smooth sections : 18 bytes each> <rigid sections : 18 bytes each>
+        <smooth index buffer> <rigid index buffer> <rigid vertex stream>
+        <influences / wedges / faces / points : lazy arrays>
+        <display factor : float32> <LOD hysteresis : float32>
+        <duplicate vertex count : int32> <max influences : int32>
+        <unique subset : int32> <use smoothing : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty LOD model."""
+        self.skinning_stream = _UnRawArray(4)
+        self.smooth_verts = _UnRawArray(16)
+        self.smooth_stream_wedges: int = 0
+        self.smooth_sections = _UnRawArray(18)
+        self.rigid_sections = _UnRawArray(18)
+        self.smooth_index_buffer = _UnStream(2)
+        self.rigid_index_buffer = _UnStream(2)
+        self.rigid_vertex_stream = _UnSkinVertexStream()
+        self.influences = _UnLazyArray(8)
+        self.wedges = _UnLazyArray(10)
+        self.faces = _UnLazyArray(8)
+        self.points = _UnLazyArray(12)
+        self.display_factor: float = 0.0
+        self.lod_hysteresis: float = 0.0
+        self.dup_vert_count: int = 0
+        self.max_influences: int = 0
+        self.unique_subset: int = 0
+        self.use_smoothing: int = 0
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the LOD model.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the skinning stream.
+        """
+        self.skinning_stream.parse(reader)
+        self.smooth_verts.parse(reader)
+        self.smooth_stream_wedges = read_int(reader)
+        self.smooth_sections.parse(reader)
+        self.rigid_sections.parse(reader)
+        self.smooth_index_buffer.parse(reader)
+        self.rigid_index_buffer.parse(reader)
+        self.rigid_vertex_stream.parse(reader)
+        self.influences.parse(reader)
+        self.wedges.parse(reader)
+        self.faces.parse(reader)
+        self.points.parse(reader)
+        self.display_factor = read_float(reader)
+        self.lod_hysteresis = read_float(reader)
+        self.dup_vert_count = read_int(reader)
+        self.max_influences = read_int(reader)
+        self.unique_subset = read_int(reader)
+        self.use_smoothing = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the LOD model.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        self.skinning_stream.serialize(writer, stream_position)
+        self.smooth_verts.serialize(writer, stream_position)
+        write_int(writer, self.smooth_stream_wedges)
+        self.smooth_sections.serialize(writer, stream_position)
+        self.rigid_sections.serialize(writer, stream_position)
+        self.smooth_index_buffer.serialize(writer, stream_position)
+        self.rigid_index_buffer.serialize(writer, stream_position)
+        self.rigid_vertex_stream.serialize(writer, stream_position)
+        self.influences.serialize(writer, stream_position)
+        self.wedges.serialize(writer, stream_position)
+        self.faces.serialize(writer, stream_position)
+        self.points.serialize(writer, stream_position)
+        write_float(writer, self.display_factor)
+        write_float(writer, self.lod_hysteresis)
+        write_int(writer, self.dup_vert_count)
+        write_int(writer, self.max_influences)
+        write_int(writer, self.unique_subset)
+        write_int(writer, self.use_smoothing)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the LOD model's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "skinning_stream": self.skinning_stream.to_dict(),
+            "smooth_verts": self.smooth_verts.to_dict(),
+            "smooth_stream_wedges": self.smooth_stream_wedges,
+            "smooth_sections": self.smooth_sections.to_dict(),
+            "rigid_sections": self.rigid_sections.to_dict(),
+            "smooth_index_buffer": self.smooth_index_buffer.to_dict(),
+            "rigid_index_buffer": self.rigid_index_buffer.to_dict(),
+            "rigid_vertex_stream": self.rigid_vertex_stream.to_dict(),
+            "influences": self.influences.to_dict(),
+            "wedges": self.wedges.to_dict(),
+            "faces": self.faces.to_dict(),
+            "points": self.points.to_dict(),
+            "display_factor": format_float32(self.display_factor),
+            "lod_hysteresis": format_float32(self.lod_hysteresis),
+            "dup_vert_count": self.dup_vert_count,
+            "max_influences": self.max_influences,
+            "unique_subset": self.unique_subset,
+            "use_smoothing": self.use_smoothing,
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the LOD model from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.skinning_stream.from_dict(src.get("skinning_stream"))
+        self.smooth_verts.from_dict(src.get("smooth_verts"))
+        self.smooth_stream_wedges = _as_int(src.get("smooth_stream_wedges"))
+        self.smooth_sections.from_dict(src.get("smooth_sections"))
+        self.rigid_sections.from_dict(src.get("rigid_sections"))
+        self.smooth_index_buffer.from_dict(src.get("smooth_index_buffer"))
+        self.rigid_index_buffer.from_dict(src.get("rigid_index_buffer"))
+        self.rigid_vertex_stream.from_dict(src.get("rigid_vertex_stream"))
+        self.influences.from_dict(src.get("influences"))
+        self.wedges.from_dict(src.get("wedges"))
+        self.faces.from_dict(src.get("faces"))
+        self.points.from_dict(src.get("points"))
+        self.display_factor = _as_float(src.get("display_factor"))
+        self.lod_hysteresis = _as_float(src.get("lod_hysteresis"))
+        self.dup_vert_count = _as_int(src.get("dup_vert_count"))
+        self.max_influences = _as_int(src.get("max_influences"))
+        self.unique_subset = _as_int(src.get("unique_subset"))
+        self.use_smoothing = _as_int(src.get("use_smoothing"))
+
+
+class _UnSkelBonePrimitive:
+    """Base for a skeletal mesh's per-bone collision primitives.
+
+    Layout::
+
+        <bone name : name ref> <offset : vector> <extent>
+        package version >= 124: <blocks karma : int32>
+        package version >= 125: <blocks non-zero extent : int32>
+                                <blocks zero extent : int32>
+
+    Subclasses supply the primitive-specific *extent* field.
+    """
+
+    def __init__(self) -> None:
+        """Initialise an unnamed primitive at the bone origin."""
+        self.bone_name = _UnNameRef()
+        self.offset: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.block_karma: int = 0
+        self.block_non_zero_extent: int = 0
+        self.block_zero_extent: int = 0
+
+    def _name_refs(self):
+        """Yield the primitive's bone name reference.
+
+        Yields:
+            _UnNameRef: The bone name.
+        """
+        yield self.bone_name
+
+    def _parse_extent(self, reader: BinaryIO) -> None:
+        """Parse the primitive-specific extent.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the extent.
+        """
+        raise NotImplementedError
+
+    def _serialize_extent(self, writer: BinaryIO) -> None:
+        """Serialise the primitive-specific extent.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+        """
+        raise NotImplementedError
+
+    def _extent_to_dict(self) -> Dict[str, Any]:
+        """Return the extent's dict representation.
+
+        Returns:
+            Dict[str, Any]: The extent fields.
+        """
+        raise NotImplementedError
+
+    def _extent_from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the extent from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The extent fields.
+        """
+        raise NotImplementedError
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Parse the collision primitive.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the bone name.
+            package ("UnPackage"): The owning package.
+        """
+        self.bone_name.parse(reader, package)
+        self.offset = _read_float_bundle(reader, _VECTOR_KEYS)
+        self._parse_extent(reader)
+        if package.version >= 124:
+            self.block_karma = read_int(reader)
+        if package.version >= 125:
+            self.block_non_zero_extent = read_int(reader)
+            self.block_zero_extent = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Serialise the collision primitive.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        self.bone_name.serialize(writer, package)
+        _write_float_bundle(writer, self.offset, _VECTOR_KEYS)
+        self._serialize_extent(writer)
+        if package.version >= 124:
+            write_int(writer, self.block_karma)
+        if package.version >= 125:
+            write_int(writer, self.block_non_zero_extent)
+            write_int(writer, self.block_zero_extent)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the primitive's dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns this primitive.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        d: Dict[str, Any] = {
+            "bone_name": self.bone_name.to_str(owner),
+            "offset": _float_bundle_to_dict(self.offset),
+        }
+        d.update(self._extent_to_dict())
+        d["block_karma"] = self.block_karma
+        d["block_non_zero_extent"] = self.block_non_zero_extent
+        d["block_zero_extent"] = self.block_zero_extent
+        return d
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the primitive from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns this primitive.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.bone_name.from_str(owner, src.get("bone_name"))
+        self.offset = _float_bundle_from_dict(src.get("offset"), _VECTOR_KEYS)
+        self._extent_from_dict(src)
+        self.block_karma = _as_int(src.get("block_karma"))
+        self.block_non_zero_extent = _as_int(src.get("block_non_zero_extent"))
+        self.block_zero_extent = _as_int(src.get("block_zero_extent"))
+
+
+class _UnSkelBoneSphere(_UnSkelBonePrimitive):
+    """A per-bone collision sphere, whose extent is a single radius."""
+
+    def __init__(self) -> None:
+        """Initialise a zero-radius sphere."""
+        super().__init__()
+        self.radius: float = 0.0
+
+    def _parse_extent(self, reader: BinaryIO) -> None:
+        """Parse the sphere radius.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the radius.
+        """
+        self.radius = read_float(reader)
+
+    def _serialize_extent(self, writer: BinaryIO) -> None:
+        """Serialise the sphere radius.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+        """
+        write_float(writer, self.radius)
+
+    def _extent_to_dict(self) -> Dict[str, Any]:
+        """Return the radius as a dict entry.
+
+        Returns:
+            Dict[str, Any]: The radius field.
+        """
+        return {"radius": format_float32(self.radius)}
+
+    def _extent_from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the radius from its dict entry.
+
+        Args:
+            data (Dict[str, Any]): The extent fields.
+        """
+        self.radius = _as_float(data.get("radius"))
+
+
+class _UnSkelBoneBox(_UnSkelBonePrimitive):
+    """A per-bone collision box, whose extent is a half-size vector."""
+
+    def __init__(self) -> None:
+        """Initialise a zero-sized box."""
+        super().__init__()
+        self.radii: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+
+    def _parse_extent(self, reader: BinaryIO) -> None:
+        """Parse the box half-sizes.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the half-size vector.
+        """
+        self.radii = _read_float_bundle(reader, _VECTOR_KEYS)
+
+    def _serialize_extent(self, writer: BinaryIO) -> None:
+        """Serialise the box half-sizes.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+        """
+        _write_float_bundle(writer, self.radii, _VECTOR_KEYS)
+
+    def _extent_to_dict(self) -> Dict[str, Any]:
+        """Return the half-sizes as a dict entry.
+
+        Returns:
+            Dict[str, Any]: The half-size field.
+        """
+        return {"radii": _float_bundle_to_dict(self.radii)}
+
+    def _extent_from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the half-sizes from their dict entry.
+
+        Args:
+            data (Dict[str, Any]): The extent fields.
+        """
+        self.radii = _float_bundle_from_dict(data.get("radii"), _VECTOR_KEYS)
+
+
+class UnSkeletalMesh(UnLodMesh):
+    """A bone-animated mesh resource.
+
+    After the shared LOD geometry come the skeletal data::
+
+        <points : 12 bytes each> <reference skeleton : bone list>
+        <default animation : object ref> <skeletal depth : int32>
+        <legacy weight index : entry list> <weights : 4 bytes each>
+        <attachment aliases : name array> <attachment bones : name array>
+        <attachment coordinates : 48 bytes each>
+        <LOD models> <default reference mesh : object ref>
+        <raw vertices / wedges / faces / influences
+         / wedge collapse list / face LOD levels : lazy arrays>
+        package version >= 120: <authentication key : uint32>
+        package version >= 122: <karma properties : object ref>
+                                <collision spheres> <collision boxes>
+                                <collision box models : object ref array>
+        package version >= 127: <collision proxy mesh : object ref>
+    """
+
+    def __init__(self, export: "UnExport") -> None:
+        """Initialise an empty skeletal mesh.
+
+        Args:
+            export ("UnExport"): The export entry that owns this mesh.
+        """
+        super().__init__(export)
+        self.points = _UnRawArray(12)
+        self.ref_skeleton: List[_UnMeshBone] = []
+        self.default_anim = _UnObjRef()
+        self.skeletal_depth: int = 0
+        self.multi_blends: List[_UnWeightIndex] = []
+        self.weights = _UnRawArray(4)
+        self.tag_aliases: List[_UnNameRef] = []
+        self.tag_names: List[_UnNameRef] = []
+        self.tag_coords = _UnRawArray(48)
+        self.lod_models: List[_UnStaticLodModel] = []
+        self.default_ref_mesh = _UnObjRef()
+        self.raw_verts = _UnLazyArray(12)
+        self.raw_wedges = _UnLazyArray(10)
+        self.raw_faces = _UnLazyArray(12)
+        self.raw_influences = _UnLazyArray(8)
+        self.raw_collapse_wedges = _UnLazyArray(2)
+        self.raw_face_level = _UnLazyArray(2)
+        self.authentication_key: int = 0
+        self.k_physics_props = _UnObjRef()
+        self.bone_collision_spheres: List[_UnSkelBoneSphere] = []
+        self.bone_collision_boxes: List[_UnSkelBoneBox] = []
+        self.bone_collision_box_models: List[_UnObjRef] = []
+        self.collision_static_mesh = _UnObjRef()
+
+    def _object_refs(self):
+        """Yield every object reference in this mesh.
+
+        Yields:
+            _UnObjRef: Each object reference, in layout order.
+        """
+        yield from super()._object_refs()
+        yield self.default_anim
+        yield self.default_ref_mesh
+        yield self.k_physics_props
+        yield from self.bone_collision_box_models
+        yield self.collision_static_mesh
+
+    def _name_refs(self):
+        """Yield every name reference in this mesh.
+
+        Yields:
+            _UnNameRef: Each name reference, in layout order.
+        """
+        yield from super()._name_refs()
+        for bone in self.ref_skeleton:
+            yield from bone._name_refs()
+        yield from self.tag_aliases
+        yield from self.tag_names
+        for sphere in self.bone_collision_spheres:
+            yield from sphere._name_refs()
+        for box in self.bone_collision_boxes:
+            yield from box._name_refs()
+
+    def _parse_tail(self, reader: BinaryIO) -> None:
+        """Parse the skeletal mesh data.
+
+        Args:
+            reader (BinaryIO): Stream positioned just past the ``None`` name.
+        """
+        super()._parse_tail(reader)
+        package = self.export.package
+        self.points.parse(reader)
+        self.ref_skeleton = [_UnMeshBone() for _ in range(_read_count(reader))]
+        for bone in self.ref_skeleton:
+            bone.parse(reader, package)
+        self.default_anim.parse(reader)
+        self.skeletal_depth = read_int(reader)
+        self.multi_blends = [_UnWeightIndex() for _ in range(_read_count(reader))]
+        for entry in self.multi_blends:
+            entry.parse(reader)
+        self.weights.parse(reader)
+        self.tag_aliases = _parse_name_array(reader, package)
+        self.tag_names = _parse_name_array(reader, package)
+        self.tag_coords.parse(reader)
+        self.lod_models = [_UnStaticLodModel() for _ in range(_read_count(reader))]
+        for model in self.lod_models:
+            model.parse(reader)
+        self.default_ref_mesh.parse(reader)
+        self.raw_verts.parse(reader)
+        self.raw_wedges.parse(reader)
+        self.raw_faces.parse(reader)
+        self.raw_influences.parse(reader)
+        self.raw_collapse_wedges.parse(reader)
+        self.raw_face_level.parse(reader)
+        if package.version >= 120:
+            self.authentication_key = read_uint(reader)
+        if package.version >= 122:
+            self.k_physics_props.parse(reader)
+            self.bone_collision_spheres = [
+                _UnSkelBoneSphere() for _ in range(_read_count(reader))
+            ]
+            for sphere in self.bone_collision_spheres:
+                sphere.parse(reader, package)
+            self.bone_collision_boxes = [
+                _UnSkelBoneBox() for _ in range(_read_count(reader))
+            ]
+            for box in self.bone_collision_boxes:
+                box.parse(reader, package)
+            self.bone_collision_box_models = [
+                _UnObjRef() for _ in range(_read_count(reader))
+            ]
+            for ref in self.bone_collision_box_models:
+                ref.parse(reader)
+        if package.version >= 127:
+            self.collision_static_mesh.parse(reader)
+
+    def _serialize_tail(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the skeletal mesh data.
+
+        Args:
+            writer (BinaryIO): Stream positioned just past the ``None`` name.
+            stream_position (int): Absolute position of the object in the
+                output stream.
+        """
+        super()._serialize_tail(writer, stream_position)
+        package = self.export.package
+        self.points.serialize(writer, stream_position)
+        write_index(writer, len(self.ref_skeleton))
+        for bone in self.ref_skeleton:
+            bone.serialize(writer, package)
+        self.default_anim.serialize(writer)
+        write_int(writer, self.skeletal_depth)
+        write_index(writer, len(self.multi_blends))
+        for entry in self.multi_blends:
+            entry.serialize(writer, stream_position)
+        self.weights.serialize(writer, stream_position)
+        _serialize_name_array(writer, package, self.tag_aliases)
+        _serialize_name_array(writer, package, self.tag_names)
+        self.tag_coords.serialize(writer, stream_position)
+        write_index(writer, len(self.lod_models))
+        for model in self.lod_models:
+            model.serialize(writer, stream_position)
+        self.default_ref_mesh.serialize(writer)
+        self.raw_verts.serialize(writer, stream_position)
+        self.raw_wedges.serialize(writer, stream_position)
+        self.raw_faces.serialize(writer, stream_position)
+        self.raw_influences.serialize(writer, stream_position)
+        self.raw_collapse_wedges.serialize(writer, stream_position)
+        self.raw_face_level.serialize(writer, stream_position)
+        if package.version >= 120:
+            write_uint(writer, self.authentication_key)
+        if package.version >= 122:
+            self.k_physics_props.serialize(writer)
+            write_index(writer, len(self.bone_collision_spheres))
+            for sphere in self.bone_collision_spheres:
+                sphere.serialize(writer, package)
+            write_index(writer, len(self.bone_collision_boxes))
+            for box in self.bone_collision_boxes:
+                box.serialize(writer, package)
+            write_index(writer, len(self.bone_collision_box_models))
+            for ref in self.bone_collision_box_models:
+                ref.serialize(writer)
+        if package.version >= 127:
+            self.collision_static_mesh.serialize(writer)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the skeletal mesh's dict representation.
+
+        Returns:
+            Dict[str, Any]: The serialisable dict representation.
+        """
+        d = super().to_dict()
+        d["points"] = self.points.to_dict()
+        d["ref_skeleton"] = [bone.to_dict(self) for bone in self.ref_skeleton]
+        d["default_anim"] = self.default_anim.to_str(self)
+        d["skeletal_depth"] = self.skeletal_depth
+        d["multi_blends"] = [entry.to_dict() for entry in self.multi_blends]
+        d["weights"] = self.weights.to_dict()
+        d["tag_aliases"] = [ref.to_str(self) for ref in self.tag_aliases]
+        d["tag_names"] = [ref.to_str(self) for ref in self.tag_names]
+        d["tag_coords"] = self.tag_coords.to_dict()
+        d["lod_models"] = [model.to_dict() for model in self.lod_models]
+        d["default_ref_mesh"] = self.default_ref_mesh.to_str(self)
+        d["raw_verts"] = self.raw_verts.to_dict()
+        d["raw_wedges"] = self.raw_wedges.to_dict()
+        d["raw_faces"] = self.raw_faces.to_dict()
+        d["raw_influences"] = self.raw_influences.to_dict()
+        d["raw_collapse_wedges"] = self.raw_collapse_wedges.to_dict()
+        d["raw_face_level"] = self.raw_face_level.to_dict()
+        d["authentication_key"] = self.authentication_key
+        d["k_physics_props"] = self.k_physics_props.to_str(self)
+        d["bone_collision_spheres"] = [
+            sphere.to_dict(self) for sphere in self.bone_collision_spheres
+        ]
+        d["bone_collision_boxes"] = [
+            box.to_dict(self) for box in self.bone_collision_boxes
+        ]
+        d["bone_collision_box_models"] = [
+            ref.to_str(self) for ref in self.bone_collision_box_models
+        ]
+        d["collision_static_mesh"] = self.collision_static_mesh.to_str(self)
+        return d
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the skeletal mesh from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The dict representation to load from.
+        """
+        super().from_dict(data)
+        self.points.from_dict(data.get("points"))
+        self.ref_skeleton = []
+        for value in _as_list(data.get("ref_skeleton")):
+            bone = _UnMeshBone()
+            bone.from_dict(value, self)
+            self.ref_skeleton.append(bone)
+        self.default_anim.from_str(self, data.get("default_anim"))
+        self.skeletal_depth = _as_int(data.get("skeletal_depth"))
+        self.multi_blends = []
+        for value in _as_list(data.get("multi_blends")):
+            entry = _UnWeightIndex()
+            entry.from_dict(value)
+            self.multi_blends.append(entry)
+        self.weights.from_dict(data.get("weights"))
+        self.tag_aliases = _name_array_from_list(self, data.get("tag_aliases"))
+        self.tag_names = _name_array_from_list(self, data.get("tag_names"))
+        self.tag_coords.from_dict(data.get("tag_coords"))
+        self.lod_models = []
+        for value in _as_list(data.get("lod_models")):
+            model = _UnStaticLodModel()
+            model.from_dict(value)
+            self.lod_models.append(model)
+        self.default_ref_mesh.from_str(self, data.get("default_ref_mesh"))
+        self.raw_verts.from_dict(data.get("raw_verts"))
+        self.raw_wedges.from_dict(data.get("raw_wedges"))
+        self.raw_faces.from_dict(data.get("raw_faces"))
+        self.raw_influences.from_dict(data.get("raw_influences"))
+        self.raw_collapse_wedges.from_dict(data.get("raw_collapse_wedges"))
+        self.raw_face_level.from_dict(data.get("raw_face_level"))
+        self.authentication_key = _as_int(data.get("authentication_key"))
+        self.k_physics_props.from_str(self, data.get("k_physics_props"))
+        self.bone_collision_spheres = []
+        for value in _as_list(data.get("bone_collision_spheres")):
+            sphere = _UnSkelBoneSphere()
+            sphere.from_dict(value, self)
+            self.bone_collision_spheres.append(sphere)
+        self.bone_collision_boxes = []
+        for value in _as_list(data.get("bone_collision_boxes")):
+            box = _UnSkelBoneBox()
+            box.from_dict(value, self)
+            self.bone_collision_boxes.append(box)
+        self.bone_collision_box_models = []
+        for value in _as_list(data.get("bone_collision_box_models")):
+            ref = _UnObjRef()
+            ref.from_str(self, value)
+            self.bone_collision_box_models.append(ref)
+        self.collision_static_mesh.from_str(self, data.get("collision_static_mesh"))
+
+
+def _parse_name_array(reader: BinaryIO, package: "UnPackage") -> List[_UnNameRef]:
+    """Parse a counted array of name references.
+
+    Args:
+        reader (BinaryIO): Stream positioned at the element count.
+        package ("UnPackage"): The owning package.
+
+    Returns:
+        List[_UnNameRef]: The parsed name references.
+    """
+    refs = [_UnNameRef() for _ in range(_read_count(reader))]
+    for ref in refs:
+        ref.parse(reader, package)
+    return refs
+
+
+def _serialize_name_array(
+    writer: BinaryIO, package: "UnPackage", refs: List[_UnNameRef]
+) -> None:
+    """Serialise a counted array of name references.
+
+    Args:
+        writer (BinaryIO): Stream to write to.
+        package ("UnPackage"): The owning package.
+        refs (List[_UnNameRef]): The name references to write.
+    """
+    write_index(writer, len(refs))
+    for ref in refs:
+        ref.serialize(writer, package)
+
+
+def _name_array_from_list(owner: "UnObject", data: Any) -> List[_UnNameRef]:
+    """Rebuild an array of name references from its dict representation.
+
+    Args:
+        owner ("UnObject"): The object that owns the references.
+        data (Any): The list of name strings.
+
+    Returns:
+        List[_UnNameRef]: The rebuilt name references.
+    """
+    refs: List[_UnNameRef] = []
+    for value in _as_list(data):
+        ref = _UnNameRef()
+        ref.from_str(owner, value)
+        refs.append(ref)
+    return refs
+
+
+class _UnAnalogTrack:
+    """One bone's compressed animation track.
+
+    Layout::
+
+        <flags : uint32> <orientation keys : 16 bytes each>
+        <position keys : 12 bytes each> <key times : 4 bytes each>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty track."""
+        self.flags: int = 0
+        self.key_quat = _UnRawArray(16)
+        self.key_pos = _UnRawArray(12)
+        self.key_time = _UnRawArray(4)
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the track.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the flags.
+        """
+        self.flags = read_uint(reader)
+        self.key_quat.parse(reader)
+        self.key_pos.parse(reader)
+        self.key_time.parse(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the track.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        write_uint(writer, self.flags)
+        self.key_quat.serialize(writer, stream_position)
+        self.key_pos.serialize(writer, stream_position)
+        self.key_time.serialize(writer, stream_position)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the track's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "flags": self.flags,
+            "key_quat": self.key_quat.to_dict(),
+            "key_pos": self.key_pos.to_dict(),
+            "key_time": self.key_time.to_dict(),
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the track from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.flags = _as_int(src.get("flags"))
+        self.key_quat.from_dict(src.get("key_quat"))
+        self.key_pos.from_dict(src.get("key_pos"))
+        self.key_time.from_dict(src.get("key_time"))
+
+
+class _UnMotionChunk:
+    """One animation sequence's compressed key tracks.
+
+    Layout::
+
+        <root speed : vector> <track time : float32> <start bone : int32>
+        <flags : uint32> <bone track index : 4 bytes each>
+        <bone tracks> <root track>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty motion chunk."""
+        self.root_speed_3d: Dict[str, float] = dict.fromkeys(_VECTOR_KEYS, 0.0)
+        self.track_time: float = 0.0
+        self.start_bone: int = 0
+        self.flags: int = 0
+        self.bone_indices = _UnRawArray(4)
+        self.anim_tracks: List[_UnAnalogTrack] = []
+        self.root_track = _UnAnalogTrack()
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the motion chunk.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the root speed.
+        """
+        self.root_speed_3d = _read_float_bundle(reader, _VECTOR_KEYS)
+        self.track_time = read_float(reader)
+        self.start_bone = read_int(reader)
+        self.flags = read_uint(reader)
+        self.bone_indices.parse(reader)
+        self.anim_tracks = [_UnAnalogTrack() for _ in range(_read_count(reader))]
+        for track in self.anim_tracks:
+            track.parse(reader)
+        self.root_track.parse(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the motion chunk.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        _write_float_bundle(writer, self.root_speed_3d, _VECTOR_KEYS)
+        write_float(writer, self.track_time)
+        write_int(writer, self.start_bone)
+        write_uint(writer, self.flags)
+        self.bone_indices.serialize(writer, stream_position)
+        write_index(writer, len(self.anim_tracks))
+        for track in self.anim_tracks:
+            track.serialize(writer, stream_position)
+        self.root_track.serialize(writer, stream_position)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the motion chunk's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "root_speed_3d": _float_bundle_to_dict(self.root_speed_3d),
+            "track_time": format_float32(self.track_time),
+            "start_bone": self.start_bone,
+            "flags": self.flags,
+            "bone_indices": self.bone_indices.to_dict(),
+            "anim_tracks": [track.to_dict() for track in self.anim_tracks],
+            "root_track": self.root_track.to_dict(),
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the motion chunk from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.root_speed_3d = _float_bundle_from_dict(
+            src.get("root_speed_3d"), _VECTOR_KEYS
+        )
+        self.track_time = _as_float(src.get("track_time"))
+        self.start_bone = _as_int(src.get("start_bone"))
+        self.flags = _as_int(src.get("flags"))
+        self.bone_indices.from_dict(src.get("bone_indices"))
+        self.anim_tracks = []
+        for value in _as_list(src.get("anim_tracks")):
+            track = _UnAnalogTrack()
+            track.from_dict(value)
+            self.anim_tracks.append(track)
+        self.root_track.from_dict(src.get("root_track"))
+
+
+class _UnMeshAnimNotify:
+    """One notification fired at a point within an animation sequence.
+
+    Layout::
+
+        <time : float32> <function : name ref>
+        package version >= 112: <notify object : object ref>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty notification."""
+        self.time: float = 0.0
+        self.function = _UnNameRef()
+        self.notify_object = _UnObjRef()
+
+    def _object_refs(self):
+        """Yield the notification's object reference.
+
+        Yields:
+            _UnObjRef: The notify object.
+        """
+        yield self.notify_object
+
+    def _name_refs(self):
+        """Yield the notification's function name reference.
+
+        Yields:
+            _UnNameRef: The function name.
+        """
+        yield self.function
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Parse the notification.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the time.
+            package ("UnPackage"): The owning package.
+        """
+        self.time = read_float(reader)
+        self.function.parse(reader, package)
+        if package.version >= 112:
+            self.notify_object.parse(reader)
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Serialise the notification.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        write_float(writer, self.time)
+        self.function.serialize(writer, package)
+        if package.version >= 112:
+            self.notify_object.serialize(writer)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the notification's dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns this notification.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "time": format_float32(self.time),
+            "function": self.function.to_str(owner),
+            "notify_object": self.notify_object.to_str(owner),
+        }
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the notification from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns this notification.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.time = _as_float(src.get("time"))
+        self.function.from_str(owner, src.get("function"))
+        self.notify_object.from_str(owner, src.get("notify_object"))
+
+
+class _UnMeshAnimSeq:
+    """One named animation sequence.
+
+    Layout::
+
+        package version >= 115: <bookmark : float32>
+        <name : name ref> <groups : name array>
+        <start frame : int32> <frame count : int32>
+        <notifications> <rate : float32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty sequence."""
+        self.bookmark: float = 0.0
+        self.name = _UnNameRef()
+        self.groups: List[_UnNameRef] = []
+        self.start_frame: int = 0
+        self.num_frames: int = 0
+        self.notifys: List[_UnMeshAnimNotify] = []
+        self.rate: float = 0.0
+
+    def _object_refs(self):
+        """Yield every object reference in this sequence.
+
+        Yields:
+            _UnObjRef: Each notification's notify object.
+        """
+        for notify in self.notifys:
+            yield from notify._object_refs()
+
+    def _name_refs(self):
+        """Yield every name reference in this sequence.
+
+        Yields:
+            _UnNameRef: Each name reference, in layout order.
+        """
+        yield self.name
+        yield from self.groups
+        for notify in self.notifys:
+            yield from notify._name_refs()
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Parse the sequence.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the sequence.
+            package ("UnPackage"): The owning package.
+        """
+        if package.version >= 115:
+            self.bookmark = read_float(reader)
+        self.name.parse(reader, package)
+        self.groups = _parse_name_array(reader, package)
+        self.start_frame = read_int(reader)
+        self.num_frames = read_int(reader)
+        self.notifys = [_UnMeshAnimNotify() for _ in range(_read_count(reader))]
+        for notify in self.notifys:
+            notify.parse(reader, package)
+        self.rate = read_float(reader)
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Serialise the sequence.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        if package.version >= 115:
+            write_float(writer, self.bookmark)
+        self.name.serialize(writer, package)
+        _serialize_name_array(writer, package, self.groups)
+        write_int(writer, self.start_frame)
+        write_int(writer, self.num_frames)
+        write_index(writer, len(self.notifys))
+        for notify in self.notifys:
+            notify.serialize(writer, package)
+        write_float(writer, self.rate)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the sequence's dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns this sequence.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "bookmark": format_float32(self.bookmark),
+            "name": self.name.to_str(owner),
+            "groups": [ref.to_str(owner) for ref in self.groups],
+            "start_frame": self.start_frame,
+            "num_frames": self.num_frames,
+            "notifys": [notify.to_dict(owner) for notify in self.notifys],
+            "rate": format_float32(self.rate),
+        }
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the sequence from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns this sequence.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.bookmark = _as_float(src.get("bookmark"))
+        self.name.from_str(owner, src.get("name"))
+        self.groups = _name_array_from_list(owner, src.get("groups"))
+        self.start_frame = _as_int(src.get("start_frame"))
+        self.num_frames = _as_int(src.get("num_frames"))
+        self.notifys = []
+        for value in _as_list(src.get("notifys")):
+            notify = _UnMeshAnimNotify()
+            notify.from_dict(value, owner)
+            self.notifys.append(notify)
+        self.rate = _as_float(src.get("rate"))
+
+
+class UnMeshAnimation(_UnMeshResource):
+    """A set of skeletal animation sequences.
+
+    Bones are linked to a skeletal mesh's reference skeleton by name at
+    runtime, so the resource stands on its own.  After the standard object
+    payload comes::
+
+        <internal version : int32> <bones : name / flags / parent triples>
+        <motion chunks> <sequences>
+    """
+
+    def __init__(self, export: "UnExport") -> None:
+        """Initialise an empty animation set.
+
+        Args:
+            export ("UnExport"): The export entry that owns this animation set.
+        """
+        super().__init__(export)
+        self.internal_version: int = 0
+        self.ref_bones: List[_UnNamedBone] = []
+        self.moves: List[_UnMotionChunk] = []
+        self.anim_seqs: List[_UnMeshAnimSeq] = []
+
+    def _object_refs(self):
+        """Yield every object reference in this animation set.
+
+        Yields:
+            _UnObjRef: Each object reference, in layout order.
+        """
+        for seq in self.anim_seqs:
+            yield from seq._object_refs()
+
+    def _name_refs(self):
+        """Yield every name reference in this animation set.
+
+        Yields:
+            _UnNameRef: Each name reference, in layout order.
+        """
+        for bone in self.ref_bones:
+            yield from bone._name_refs()
+        for seq in self.anim_seqs:
+            yield from seq._name_refs()
+
+    def _parse_tail(self, reader: BinaryIO) -> None:
+        """Parse the animation set.
+
+        Args:
+            reader (BinaryIO): Stream positioned just past the ``None`` name.
+        """
+        super()._parse_tail(reader)
+        package = self.export.package
+        self.internal_version = read_int(reader)
+        self.ref_bones = [_UnNamedBone() for _ in range(_read_count(reader))]
+        for bone in self.ref_bones:
+            bone.parse(reader, package)
+        self.moves = [_UnMotionChunk() for _ in range(_read_count(reader))]
+        for chunk in self.moves:
+            chunk.parse(reader)
+        self.anim_seqs = [_UnMeshAnimSeq() for _ in range(_read_count(reader))]
+        for seq in self.anim_seqs:
+            seq.parse(reader, package)
+
+    def _serialize_tail(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the animation set.
+
+        Args:
+            writer (BinaryIO): Stream positioned just past the ``None`` name.
+            stream_position (int): Absolute position of the object in the
+                output stream.
+        """
+        super()._serialize_tail(writer, stream_position)
+        package = self.export.package
+        write_int(writer, self.internal_version)
+        write_index(writer, len(self.ref_bones))
+        for bone in self.ref_bones:
+            bone.serialize(writer, package)
+        write_index(writer, len(self.moves))
+        for chunk in self.moves:
+            chunk.serialize(writer, stream_position)
+        write_index(writer, len(self.anim_seqs))
+        for seq in self.anim_seqs:
+            seq.serialize(writer, package)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the animation set's dict representation.
+
+        Returns:
+            Dict[str, Any]: The serialisable dict representation.
+        """
+        d = super().to_dict()
+        d["internal_version"] = self.internal_version
+        d["ref_bones"] = [bone.to_dict(self) for bone in self.ref_bones]
+        d["moves"] = [chunk.to_dict() for chunk in self.moves]
+        d["anim_seqs"] = [seq.to_dict(self) for seq in self.anim_seqs]
+        return d
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the animation set from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The dict representation to load from.
+        """
+        super().from_dict(data)
+        self.internal_version = _as_int(data.get("internal_version"))
+        self.ref_bones = []
+        for value in _as_list(data.get("ref_bones")):
+            bone = _UnNamedBone()
+            bone.from_dict(value, self)
+            self.ref_bones.append(bone)
+        self.moves = []
+        for value in _as_list(data.get("moves")):
+            chunk = _UnMotionChunk()
+            chunk.from_dict(value)
+            self.moves.append(chunk)
+        self.anim_seqs = []
+        for value in _as_list(data.get("anim_seqs")):
+            seq = _UnMeshAnimSeq()
+            seq.from_dict(value, self)
+            self.anim_seqs.append(seq)
+
+
+class _UnNamedBone:
+    """One bone of an animation set's own skeleton.
+
+    Layout::
+
+        <name : name ref> <flags : uint32> <parent index : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an unnamed root bone."""
+        self.name = _UnNameRef()
+        self.flags: int = 0
+        self.parent_index: int = 0
+
+    def _name_refs(self):
+        """Yield the bone's name reference.
+
+        Yields:
+            _UnNameRef: The bone name.
+        """
+        yield self.name
+
+    def parse(self, reader: BinaryIO, package: "UnPackage") -> None:
+        """Parse the bone.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the bone name.
+            package ("UnPackage"): The owning package.
+        """
+        self.name.parse(reader, package)
+        self.flags = read_uint(reader)
+        self.parent_index = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, package: "UnPackage") -> None:
+        """Serialise the bone.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            package ("UnPackage"): The owning package.
+        """
+        self.name.serialize(writer, package)
+        write_uint(writer, self.flags)
+        write_int(writer, self.parent_index)
+
+    def to_dict(self, owner: "UnObject") -> Dict[str, Any]:
+        """Return the bone's dict representation.
+
+        Args:
+            owner ("UnObject"): The object that owns this bone.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "name": self.name.to_str(owner),
+            "flags": self.flags,
+            "parent_index": self.parent_index,
+        }
+
+    def from_dict(self, data: Any, owner: "UnObject") -> None:
+        """Populate the bone from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+            owner ("UnObject"): The object that owns this bone.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.name.from_str(owner, src.get("name"))
+        self.flags = _as_int(src.get("flags"))
+        self.parent_index = _as_int(src.get("parent_index"))
+
+
+class _UnUvStream:
+    """One texture-coordinate stream of a static mesh.
+
+    Layout::
+
+        <UV pairs : 8 bytes each> <coordinate index : int32>
+        <revision : int32>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty UV stream."""
+        self.uvs = _UnRawArray(8)
+        self.coordinate_index: int = 0
+        self.revision: int = 0
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the UV stream.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the UV pair count.
+        """
+        self.uvs.parse(reader)
+        self.coordinate_index = read_int(reader)
+        self.revision = read_int(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the UV stream.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        self.uvs.serialize(writer, stream_position)
+        write_int(writer, self.coordinate_index)
+        write_int(writer, self.revision)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the UV stream's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {
+            "uvs": self.uvs.to_dict(),
+            "coordinate_index": self.coordinate_index,
+            "revision": self.revision,
+        }
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the UV stream from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.uvs.from_dict(src.get("uvs"))
+        self.coordinate_index = _as_int(src.get("coordinate_index"))
+        self.revision = _as_int(src.get("revision"))
+
+
+class _UnKDopTree:
+    """A static mesh's collision bounding-volume tree.
+
+    Layout::
+
+        <nodes : 32 bytes each> <triangles : 8 bytes each>
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty tree."""
+        self.nodes = _UnRawArray(32)
+        self.triangles = _UnRawArray(8)
+
+    def parse(self, reader: BinaryIO) -> None:
+        """Parse the tree.
+
+        Args:
+            reader (BinaryIO): Stream positioned at the node count.
+        """
+        self.nodes.parse(reader)
+        self.triangles.parse(reader)
+
+    def serialize(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the tree.
+
+        Args:
+            writer (BinaryIO): Stream to write to.
+            stream_position (int): Absolute position of the owning object.
+        """
+        self.nodes.serialize(writer, stream_position)
+        self.triangles.serialize(writer, stream_position)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the tree's dict representation.
+
+        Returns:
+            Dict[str, Any]: The transport representation.
+        """
+        return {"nodes": self.nodes.to_dict(), "triangles": self.triangles.to_dict()}
+
+    def from_dict(self, data: Any) -> None:
+        """Populate the tree from its dict representation.
+
+        Args:
+            data (Any): The transport representation.
+        """
+        src = data if isinstance(data, dict) else {}
+        self.nodes.from_dict(src.get("nodes"))
+        self.triangles.from_dict(src.get("triangles"))
+
+
+class UnStaticMesh(UnPrimitive):
+    """A rigid, pre-triangulated mesh resource.
+
+    Its material list and collision options are ordinary script properties, so
+    they arrive in the tagged-property block.  After the primitive bounds
+    comes::
+
+        <sections : 14 bytes each> <bounding box : repeated>
+        <vertex stream> <colour stream> <alpha stream> <UV streams>
+        <index buffer> <wireframe index buffer>
+        <collision model : object ref> <collision tree>
+        <source triangles : lazy array> <internal version : int32>
+        licensee version == 0x16: <smoothing threshold : float32>
+        licensee version >  0x16: <max smoothing angles : 4 bytes each>
+        package version >= 100: <karma properties : object ref>
+        package version >= 120: <authentication key : uint32>
+
+    Package versions below 112 (which store their render data per section) fall
+    back to a verbatim payload.
+    """
+
+    def __init__(self, export: "UnExport") -> None:
+        """Initialise an empty static mesh.
+
+        Args:
+            export ("UnExport"): The export entry that owns this mesh.
+        """
+        super().__init__(export)
+        self.sections = _UnRawArray(14)
+        self.sections_bounding_box: Dict[str, Any] = _empty_box()
+        self.vertex_stream = _UnStream(24)
+        self.color_stream = _UnStream(4)
+        self.alpha_stream = _UnStream(4)
+        self.uv_streams: List[_UnUvStream] = []
+        self.index_buffer = _UnStream(2)
+        self.wireframe_index_buffer = _UnStream(2)
+        self.collision_model = _UnObjRef()
+        self.kdop_tree = _UnKDopTree()
+        self.raw_triangles = _UnStaticMeshTriangleArray()
+        self.internal_version: int = 0
+        self.smoothing_threshold: float = 0.0
+        self.max_smoothing_angles = _UnRawArray(4)
+        self.k_physics_props = _UnObjRef()
+        self.authentication_key: int = 0
+
+    def _object_refs(self):
+        """Yield every object reference in this mesh.
+
+        Yields:
+            _UnObjRef: Each object reference, in layout order.
+        """
+        yield from super()._object_refs()
+        yield self.collision_model
+        yield self.k_physics_props
+
+    def _parse_tail(self, reader: BinaryIO) -> None:
+        """Parse the static mesh data.
+
+        Args:
+            reader (BinaryIO): Stream positioned just past the ``None`` name.
+
+        Raises:
+            ValueError: When the package predates the shared render streams.
+        """
+        super()._parse_tail(reader)
+        package = self.export.package
+        if package.version < 112:
+            raise ValueError(f"unsupported package version {package.version}")
+        self.sections.parse(reader)
+        self.sections_bounding_box = _read_box(reader)
+        self.vertex_stream.parse(reader)
+        self.color_stream.parse(reader)
+        self.alpha_stream.parse(reader)
+        self.uv_streams = [_UnUvStream() for _ in range(_read_count(reader))]
+        for stream in self.uv_streams:
+            stream.parse(reader)
+        self.index_buffer.parse(reader)
+        self.wireframe_index_buffer.parse(reader)
+        self.collision_model.parse(reader)
+        self.kdop_tree.parse(reader)
+        self.raw_triangles.parse(reader)
+        self.internal_version = read_int(reader)
+        if package.licensee_version == 0x16:
+            self.smoothing_threshold = read_float(reader)
+        elif package.licensee_version > 0x16:
+            self.max_smoothing_angles.parse(reader)
+        if package.version >= 100:
+            self.k_physics_props.parse(reader)
+        if package.version >= 120:
+            self.authentication_key = read_uint(reader)
+
+    def _serialize_tail(self, writer: BinaryIO, stream_position: int) -> None:
+        """Serialise the static mesh data.
+
+        Args:
+            writer (BinaryIO): Stream positioned just past the ``None`` name.
+            stream_position (int): Absolute position of the object in the
+                output stream.
+        """
+        super()._serialize_tail(writer, stream_position)
+        package = self.export.package
+        self.sections.serialize(writer, stream_position)
+        _write_box(writer, self.sections_bounding_box)
+        self.vertex_stream.serialize(writer, stream_position)
+        self.color_stream.serialize(writer, stream_position)
+        self.alpha_stream.serialize(writer, stream_position)
+        write_index(writer, len(self.uv_streams))
+        for stream in self.uv_streams:
+            stream.serialize(writer, stream_position)
+        self.index_buffer.serialize(writer, stream_position)
+        self.wireframe_index_buffer.serialize(writer, stream_position)
+        self.collision_model.serialize(writer)
+        self.kdop_tree.serialize(writer, stream_position)
+        self.raw_triangles.serialize(writer, stream_position)
+        write_int(writer, self.internal_version)
+        if package.licensee_version == 0x16:
+            write_float(writer, self.smoothing_threshold)
+        elif package.licensee_version > 0x16:
+            self.max_smoothing_angles.serialize(writer, stream_position)
+        if package.version >= 100:
+            self.k_physics_props.serialize(writer)
+        if package.version >= 120:
+            write_uint(writer, self.authentication_key)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the static mesh's dict representation.
+
+        Returns:
+            Dict[str, Any]: The serialisable dict representation.
+        """
+        d = super().to_dict()
+        d["sections"] = self.sections.to_dict()
+        d["sections_bounding_box"] = _box_to_dict(self.sections_bounding_box)
+        d["vertex_stream"] = self.vertex_stream.to_dict()
+        d["color_stream"] = self.color_stream.to_dict()
+        d["alpha_stream"] = self.alpha_stream.to_dict()
+        d["uv_streams"] = [stream.to_dict() for stream in self.uv_streams]
+        d["index_buffer"] = self.index_buffer.to_dict()
+        d["wireframe_index_buffer"] = self.wireframe_index_buffer.to_dict()
+        d["collision_model"] = self.collision_model.to_str(self)
+        d["kdop_tree"] = self.kdop_tree.to_dict()
+        d["raw_triangles"] = self.raw_triangles.to_dict()
+        d["internal_version"] = self.internal_version
+        d["smoothing_threshold"] = format_float32(self.smoothing_threshold)
+        d["max_smoothing_angles"] = self.max_smoothing_angles.to_dict()
+        d["k_physics_props"] = self.k_physics_props.to_str(self)
+        d["authentication_key"] = self.authentication_key
+        return d
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Populate the static mesh from its dict representation.
+
+        Args:
+            data (Dict[str, Any]): The dict representation to load from.
+        """
+        super().from_dict(data)
+        self.sections.from_dict(data.get("sections"))
+        self.sections_bounding_box = _box_from_dict(data.get("sections_bounding_box"))
+        self.vertex_stream.from_dict(data.get("vertex_stream"))
+        self.color_stream.from_dict(data.get("color_stream"))
+        self.alpha_stream.from_dict(data.get("alpha_stream"))
+        self.uv_streams = []
+        for value in _as_list(data.get("uv_streams")):
+            stream = _UnUvStream()
+            stream.from_dict(value)
+            self.uv_streams.append(stream)
+        self.index_buffer.from_dict(data.get("index_buffer"))
+        self.wireframe_index_buffer.from_dict(data.get("wireframe_index_buffer"))
+        self.collision_model.from_str(self, data.get("collision_model"))
+        self.kdop_tree.from_dict(data.get("kdop_tree"))
+        self.raw_triangles.from_dict(data.get("raw_triangles"))
+        self.internal_version = _as_int(data.get("internal_version"))
+        self.smoothing_threshold = _as_float(data.get("smoothing_threshold"))
+        self.max_smoothing_angles.from_dict(data.get("max_smoothing_angles"))
+        self.k_physics_props.from_str(self, data.get("k_physics_props"))
+        self.authentication_key = _as_int(data.get("authentication_key"))
+
+
+def build_mesh_object(
+    mesh_class: Type["UnObject"], export: "UnExport"
+) -> Optional["UnObject"]:
+    """Return a structured mesh object for *export*, or ``None``.
+
+    A mesh resource carries a long native tail whose layout depends on both the
+    package version and the resource's own internal version.  The structured
+    object is only accepted when re-serialising the parse reproduces the
+    export's bytes exactly; an unmodelled variant therefore degrades to a
+    verbatim raw blob instead of failing the whole package load.
+
+    Args:
+        mesh_class (Type[UnObject]): The mesh type to instantiate.
+        export (UnExport): The export to structure.
+
+    Returns:
+        Optional[UnObject]: The parsed mesh, or ``None`` when its payload does
+            not round-trip byte-for-byte.
+    """
+    obj = mesh_class(export)
+    data = export.export_data
+    if not data:
+        # No bytes to validate against — an XML import supplies them later.
+        return obj
+    try:
+        obj._parse(io.BytesIO(data))
+        check = io.BytesIO()
+        obj._serialize(check, max(export.original_data_offset, 0))
+        if check.getvalue() == data:
+            return obj
+    except Exception:
+        pass
+    return None
+
+
+# ===================================================================== #
 #  Object factory
 # ===================================================================== #
 
@@ -6055,6 +9026,17 @@ _CONTENT_CLASS_NAME_MAP = {
     "Engine.Combiner": UnCombiner,
     "Engine.Shader": UnShader,
     "Engine.FinalBlend": UnFinalBlend,
+}
+
+
+# Mesh resources.  Also content, but built through
+# :func:`build_mesh_object` rather than instantiated directly, so an
+# unmodelled layout variant can fall back to a verbatim raw blob.  Kept out of
+# ``_CLASS_NAME_MAP`` for that reason; ``create_object`` checks this map first.
+_MESH_CLASS_NAME_MAP: Dict[str, Type["UnObject"]] = {
+    "Engine.StaticMesh": UnStaticMesh,
+    "Engine.SkeletalMesh": UnSkeletalMesh,
+    "Engine.MeshAnimation": UnMeshAnimation,
 }
 
 
@@ -6103,8 +9085,12 @@ class UnDefaultObject(UnObject):
 def create_object(export: "UnExport") -> Optional["UnObject"]:
     """Create the appropriate object type for *export* based on its class name.
 
-    Returns ``None`` if the class is not recognised.
+    Returns ``None`` if the class is not recognised, or when a mesh resource's
+    payload does not round-trip byte-for-byte through the structured parse.
     """
+    mesh_class = _MESH_CLASS_NAME_MAP.get(export.class_name_string)
+    if mesh_class is not None:
+        return build_mesh_object(mesh_class, export)
     cls = _CLASS_NAME_MAP.get(export.class_name_string)
     if cls is None:
         return None

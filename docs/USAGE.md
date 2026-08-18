@@ -82,8 +82,14 @@ plain tagged-property list (e.g. GUI components such as `GUIButton`/`GUILabel`)
 are written **inline** as structured `<ObjectData>` — just like
 `defaultproperties` — instead of an opaque `Raw<Class>/<name>.bin` sidecar.
 Only pure property containers that round-trip byte-for-byte are inlined;
-anything with trailing native data (textures, meshes, sounds, …) still lands
-in a `Raw<Class>/` binary sidecar.
+anything with trailing native data that the tool does not model (a `VertMesh`,
+say) still lands in a `Raw<Class>/` binary sidecar.
+
+Mesh resources (`StaticMesh`, `SkeletalMesh`, `MeshAnimation`) are modelled, so
+their structure — bounds, LOD levels, reference skeleton, bone names, animation
+sequences, material references — is written as readable XML. Their bulk element
+data (vertices, indices, animation keys) goes into one `<Class>/<name>.bin`
+sidecar per object, with only its byte length left in the XML.
 
 ```bash
 python -m ut2004packageutil xml-export -i <UT2004.ini> -p <package.u> -o <out_dir> [-g] [-f]
